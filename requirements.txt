@@ -1,0 +1,6 @@
+psycopg2-binary==2.9.9
+python-dotenv==1.0.0
+earthengine-api==0.1.387
+google-cloud-tasks==2.14.1
+google-cloud-secret-manager==2.16.4
+flask==3.0.0

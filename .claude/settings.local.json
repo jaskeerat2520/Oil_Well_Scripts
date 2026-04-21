@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__claude_ai_Supabase__apply_migration",
+      "mcp__claude_ai_Supabase__execute_sql",
+      "Bash(npm run *)",
+      "Bash(curl -s --max-time 10 -o /tmp/naip_test.jpg \"https://gis.apfo.usda.gov/arcgis/rest/services/NAIP/USDA_CONUS_PRIME/ImageServer/tile/14/6271/4070\")",
+      "Read(//tmp/**)"
+    ]
+  },
+  "outputStyle": "Explanatory",
+  "prefersReducedMotion": false
+}
