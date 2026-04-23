@@ -120,18 +120,25 @@ def recalculate_scores(conn):
         """)
         print(f"[OK]    years_inactive updated for {cur.rowcount:,} wells.")
 
-        # Step 2: Recalculate inactivity_score from years_inactive
+        # Step 2: Recalculate inactivity_score from years_inactive.
+        # Producing wells get 0 regardless of years_inactive — their 1-2 year
+        # "idle" window is a reporting-lag artifact (last_nonzero_production_year
+        # is annual-resolution, RBDMS reports trail calendar time), not true
+        # dormancy. Scoring them as inactive would double-penalise active wells.
         cur.execute("""
-            UPDATE well_risk_scores
+            UPDATE well_risk_scores r
             SET inactivity_score = CASE
-                WHEN years_inactive >= 50 THEN 100
-                WHEN years_inactive >= 25 THEN 80
-                WHEN years_inactive >= 15 THEN 60
-                WHEN years_inactive >= 10 THEN 40
-                WHEN years_inactive >= 5  THEN 20
-                WHEN years_inactive IS NOT NULL THEN 5
+                WHEN w.status = 'Producing' THEN 0
+                WHEN r.years_inactive >= 50 THEN 100
+                WHEN r.years_inactive >= 25 THEN 80
+                WHEN r.years_inactive >= 15 THEN 60
+                WHEN r.years_inactive >= 10 THEN 40
+                WHEN r.years_inactive >= 5  THEN 20
+                WHEN r.years_inactive IS NOT NULL THEN 5
                 ELSE 50  -- unknown: conservative middle estimate
-            END;
+            END
+            FROM wells w
+            WHERE r.api_no = w.api_no;
         """)
         print(f"[OK]    inactivity_score recalculated for {cur.rowcount:,} wells.")
 
