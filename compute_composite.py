@@ -16,10 +16,13 @@ Missing components are handled by renormalizing: the weights of the *available*
 dimensions sum to 100% for each well, so partial-data wells are scored fairly
 against themselves rather than penalized.
 
-Priority buckets:
-    composite ≥ 75  → critical
-    composite ≥ 50  → high
-    composite ≥ 25  → medium
+Priority buckets (calibrated to the realised composite distribution — RS
+signals contribute 0s rather than NULLs for wells without anomalies, which
+caps the achievable composite well below 100):
+
+    composite ≥ 45  → critical   (~top 0.06% — map-noticeable elite tier)
+    composite ≥ 35  → high       (~top 1.3%)
+    composite ≥ 25  → medium     (~top 17.6%)
     else            → low
 
 Producing wells are capped at priority='medium' regardless of composite
@@ -124,8 +127,8 @@ SET
         WHEN f.composite >= 25 THEN 'medium'
         ELSE 'low'
       END
-    WHEN f.composite >= 75 THEN 'critical'
-    WHEN f.composite >= 50 THEN 'high'
+    WHEN f.composite >= 45 THEN 'critical'
+    WHEN f.composite >= 35 THEN 'high'
     WHEN f.composite >= 25 THEN 'medium'
     ELSE 'low'
   END,
