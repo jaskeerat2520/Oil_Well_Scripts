@@ -8,6 +8,7 @@
 #
 # Usage:
 #   ./enqueue_counties.sh emissions         # fires to emissions-worker URL
+#   ./enqueue_counties.sh population        # fires to population-worker URL
 #   ./enqueue_counties.sh surface_anomalies # fires to surface-anomalies-worker
 #   ./enqueue_counties.sh both              # emissions first, then surface_anomalies
 #
@@ -22,8 +23,8 @@ PAR="${PAR:-4}"
 
 TARGET="${1:-}"
 
-if [[ -z "$TARGET" || ( "$TARGET" != "emissions" && "$TARGET" != "surface_anomalies" && "$TARGET" != "both" ) ]]; then
-  echo "Usage: $0 [emissions | surface_anomalies | both]"
+if [[ -z "$TARGET" || ( "$TARGET" != "emissions" && "$TARGET" != "population" && "$TARGET" != "surface_anomalies" && "$TARGET" != "pad_detection" && "$TARGET" != "both" ) ]]; then
+  echo "Usage: $0 [emissions | population | surface_anomalies | pad_detection | both]"
   exit 1
 fi
 
@@ -83,7 +84,9 @@ enqueue() {
 
 case "$TARGET" in
   emissions)         enqueue emissions-worker ;;
+  population)        enqueue population-worker ;;
   surface_anomalies) enqueue surface-anomalies-worker ;;
+  pad_detection)     enqueue pad-detection-worker ;;
   both)
     enqueue emissions-worker
     enqueue surface-anomalies-worker ;;
@@ -93,3 +96,4 @@ echo ""
 echo "🎯 Done. Check progress in Supabase:"
 echo "   SELECT COUNT(*) FROM well_remote_sensing WHERE emissions_processed_at IS NOT NULL;"
 echo "   SELECT COUNT(*) FROM well_surface_anomalies;"
+echo "   SELECT COUNT(*), AVG(pad_score) FROM well_pad_detection WHERE pad_score >= 30;"

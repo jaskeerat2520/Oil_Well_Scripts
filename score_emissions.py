@@ -1,23 +1,31 @@
 """
 score_emissions.py
 
-Detects active leak / emission signals at Ohio well sites using two sensors:
+Detects emission signals at Ohio well sites using two per-well sources:
 
-  1. Sentinel-5P CH4  (COPERNICUS/S5P/OFFL/L3_CH4)
-       ~7 km resolution. Multi-year mean (2021-2024) for the 5.5 km disk
-       containing the well vs a 10 km background disk.
-       Neighborhood-scale: wells inside the same cell share the signal.
+  1. Methane plume proximity (table: methane_plumes)
+       Combined CarbonMapper (Tanager-1 + aircraft) and MethaneAIR (aircraft)
+       point detections. Truly per-leak — wells close to a known plume get a
+       high score; wells far from any detection get zero plume contribution.
 
   2. Landsat 9 thermal (LANDSAT/LC09/C02/T1_L2, band ST_B10)
-       100 m resolution. Summer-only (Jun-Aug) mean land-surface temperature
-       over 100 m well buffer vs 1 km background ring.
-       Per-well scale: active venting warms the pad by a few °C.
+       100 m resolution. Summer-only (Jun-Aug 2022-2024) mean land-surface
+       temperature over a 100 m well buffer vs a 1 km background ring.
+       Active venting warms the pad by a few °C.
 
-Writes emissions columns of well_remote_sensing and an emissions_risk_score
-(0-100) combining both signals.
+The previous Sentinel-5P CH4 component was removed: its ~7 km pixels smeared
+the same score across every well in a cell, producing pixel-shaped red blobs
+on the map rather than per-well signals.
+
+Writes to well_remote_sensing:
+    nearest_plume_m, nearest_plume_source, max_plume_flux_kgph_5km,
+    thermal_well_c, thermal_background_c, thermal_anomaly_c,
+    emissions_risk_score, emissions_processed_at
+and NULLs the legacy CH4 columns (ch4_well_ppb, ch4_background_ppb,
+ch4_anomaly_ratio, ch4_is_anomaly).
 
 Usage:
-    python score_emissions.py                 # all 131K wells
+    python score_emissions.py                 # all unprocessed wells
     python score_emissions.py --county STARK
     python score_emissions.py --reprocess
 """
@@ -40,21 +48,16 @@ DB_PASSWORD = os.getenv("SUPABASE_DB_PASSWORD")
 DB_PORT     = int(os.getenv("SUPABASE_DB_PORT", 5432))
 
 # ── Analysis config ────────────────────────────────────────────────────────────
-CH4_START = "2021-01-01"
-CH4_END   = "2024-12-31"
-CH4_WELL_BUFFER_M = 5500
-CH4_BG_BUFFER_M   = 10000
-
-# Landsat-9 is cleanly calibrated from its 2021-10 launch; use 2022 onwards
+# Landsat 9 is cleanly calibrated from its 2021-10 launch; use 2022 onwards.
 THERMAL_START = "2022-06-01"
 THERMAL_END   = "2024-09-01"
 THERMAL_WELL_BUFFER_M = 100
 THERMAL_BG_BUFFER_M   = 1000
 THERMAL_CLOUD_MAX     = 20
 
-# Anomaly thresholds
-CH4_ANOMALY_RATIO      = 1.05    # well column > 5% above background
-THERMAL_ANOMALY_DELTA  = 2.0     # well warmer by >2°C than surroundings
+# Plume proximity search radius — wells beyond this get no plume contribution.
+PLUME_SEARCH_M        = 10000
+PLUME_FLUX_BONUS_KGPH = 1000   # large-leak bonus threshold
 
 BATCH_SIZE = 80
 SLEEP_S    = 0.4
@@ -100,17 +103,46 @@ def get_wells_for_county(cur, county: str) -> list[dict]:
     return [{"api_no": r[0], "lat": r[1], "lng": r[2]} for r in cur.fetchall()]
 
 
-# ── Earth Engine source images ─────────────────────────────────────────────────
-def get_ch4_mean() -> ee.Image:
-    return (
-        ee.ImageCollection("COPERNICUS/S5P/OFFL/L3_CH4")
-        .filterDate(CH4_START, CH4_END)
-        .select("CH4_column_volume_mixing_ratio_dry_air")
-        .mean()
-        .rename("ch4")
-    )
+# ── Plume proximity (per batch, one SQL call) ─────────────────────────────────
+def fetch_plume_proximity(cur, api_nos: list[str]) -> dict[str, tuple]:
+    """
+    For each well in api_nos, return (nearest_m, nearest_source, max_flux_5km).
+    Wells with no plume within PLUME_SEARCH_M are omitted from the result
+    (callers default missing wells to (None, None, None)).
+    """
+    cur.execute("""
+        WITH candidates AS (
+            SELECT w.api_no,
+                   p.source,
+                   p.emission_kgph,
+                   ST_Distance(
+                       w.geometry::geography,
+                       p.geometry::geography
+                   ) AS dist_m
+            FROM wells w
+            JOIN methane_plumes p
+              ON ST_DWithin(
+                     w.geometry::geography,
+                     p.geometry::geography,
+                     %s
+                 )
+            WHERE w.api_no = ANY(%s)
+        )
+        SELECT
+          api_no,
+          MIN(dist_m)                                            AS nearest_m,
+          (ARRAY_AGG(source ORDER BY dist_m ASC))[1]             AS nearest_source,
+          MAX(emission_kgph) FILTER (WHERE dist_m <= 5000)       AS max_flux_5km
+        FROM candidates
+        GROUP BY api_no
+    """, (PLUME_SEARCH_M, api_nos))
+    return {
+        row[0]: (row[1], row[2], row[3])
+        for row in cur.fetchall()
+    }
 
 
+# ── Earth Engine thermal source ───────────────────────────────────────────────
 def get_thermal_mean(region: ee.Geometry) -> ee.Image:
     """
     Landsat 9 Collection-2 L2 thermal: summer mean LST in °C.
@@ -141,20 +173,38 @@ def get_thermal_mean(region: ee.Geometry) -> ee.Image:
 
 
 # ── Scoring ────────────────────────────────────────────────────────────────────
-def score_emissions(ch4_ratio: float | None, thermal_delta: float | None) -> int:
+def score_emissions(
+    nearest_plume_m: float | None,
+    max_flux_5km: float | None,
+    thermal_delta: float | None,
+) -> int:
     """
-    Combined 0-100 score from CH4 neighborhood anomaly + thermal per-well anomaly.
+    Combined 0-100 score from plume proximity + thermal per-well anomaly.
 
-    CH4:     1.05 → 30, 1.10 → 60, 1.15+ → 80
-    Thermal: 2°C → 20, 5°C → 40, 8°C+ → 60
-    Sum capped at 100.
+    plume_pts:
+        ≤   500 m → +50
+        ≤ 1,000 m → +35
+        ≤ 2,500 m → +20
+        ≤ 5,000 m → +10
+        further   →   0
+        + flux bonus: +20 if any plume within 5 km has emission_kgph ≥ 1000
+
+    thermal_pts:
+        Δ ≥ 8°C → +60
+        Δ ≥ 5°C → +40
+        Δ ≥ 2°C → +20
+        else    →   0
     """
     score = 0
 
-    if ch4_ratio is not None:
-        if   ch4_ratio >= 1.15: score += 80
-        elif ch4_ratio >= 1.10: score += 60
-        elif ch4_ratio >= 1.05: score += 30
+    if nearest_plume_m is not None:
+        if   nearest_plume_m <=   500: score += 50
+        elif nearest_plume_m <=  1000: score += 35
+        elif nearest_plume_m <=  2500: score += 20
+        elif nearest_plume_m <=  5000: score += 10
+
+        if max_flux_5km is not None and max_flux_5km >= PLUME_FLUX_BONUS_KGPH:
+            score += 20
 
     if thermal_delta is not None:
         if   thermal_delta >= 8.0: score += 60
@@ -165,10 +215,9 @@ def score_emissions(ch4_ratio: float | None, thermal_delta: float | None) -> int
 
 
 # ── Core processing ────────────────────────────────────────────────────────────
-def process_batch(wells: list[dict], county: str, cur,
-                  ch4_img: ee.Image) -> int:
-    points = [ee.Geometry.Point([w["lng"], w["lat"]]) for w in wells]
+def process_batch(wells: list[dict], county: str, cur) -> int:
     api_nos = [w["api_no"] for w in wells]
+    points  = [ee.Geometry.Point([w["lng"], w["lat"]]) for w in wells]
 
     # Thermal image is filterBounds-dependent — rebuild per batch bbox
     bbox_geom = ee.FeatureCollection([
@@ -176,15 +225,12 @@ def process_batch(wells: list[dict], county: str, cur,
     ]).geometry().bounds()
     thermal_img = get_thermal_mean(bbox_geom)
 
-    # Build four feature collections: CH4 well/bg, thermal well/bg
     def fc(bufs):
         return ee.FeatureCollection([
             ee.Feature(p.buffer(bufs), {"api_no": api})
             for p, api in zip(points, api_nos)
         ])
 
-    fc_ch4_well  = fc(CH4_WELL_BUFFER_M)
-    fc_ch4_bg    = fc(CH4_BG_BUFFER_M)
     fc_thrm_well = fc(THERMAL_WELL_BUFFER_M)
     fc_thrm_bg   = fc(THERMAL_BG_BUFFER_M)
 
@@ -197,37 +243,37 @@ def process_batch(wells: list[dict], county: str, cur,
         return {f["properties"]["api_no"]: f["properties"].get(band) for f in result}
 
     try:
-        ch4_well  = reduce_to_map(ch4_img,     fc_ch4_well,  "mean", 5500)
-        ch4_bg    = reduce_to_map(ch4_img,     fc_ch4_bg,    "mean", 5500)
         thrm_well = reduce_to_map(thermal_img, fc_thrm_well, "mean", 100)
         thrm_bg   = reduce_to_map(thermal_img, fc_thrm_bg,   "mean", 100)
     except Exception as e:
         print(f"  [EE error] {e}")
         return 0
 
+    # Plume proximity — one SQL call per batch.
+    plume_map = fetch_plume_proximity(cur, api_nos)
+
     rows = []
     for api in api_nos:
-        ch4_w  = ch4_well.get(api)
-        ch4_b  = ch4_bg.get(api)
         thrm_w = thrm_well.get(api)
         thrm_b = thrm_bg.get(api)
-
-        ch4_ratio = (ch4_w / ch4_b) if (ch4_w and ch4_b and ch4_b > 0) else None
-        ch4_flag  = ch4_ratio is not None and ch4_ratio >= CH4_ANOMALY_RATIO
-
         thrm_delta = (thrm_w - thrm_b) if (thrm_w is not None and thrm_b is not None) else None
 
-        score = score_emissions(ch4_ratio, thrm_delta)
+        nearest_m, nearest_src, max_flux_5km = plume_map.get(api, (None, None, None))
+
+        score = score_emissions(nearest_m, max_flux_5km, thrm_delta)
 
         rows.append((
             api, county,
-            round(ch4_w, 2)    if ch4_w    is not None else None,
-            round(ch4_b, 2)    if ch4_b    is not None else None,
-            round(ch4_ratio, 4) if ch4_ratio is not None else None,
-            ch4_flag,
-            round(thrm_w, 2)   if thrm_w   is not None else None,
-            round(thrm_b, 2)   if thrm_b   is not None else None,
+            # legacy CH4 columns NULLed out
+            None, None, None, None,
+            # thermal
+            round(thrm_w, 2)     if thrm_w     is not None else None,
+            round(thrm_b, 2)     if thrm_b     is not None else None,
             round(thrm_delta, 2) if thrm_delta is not None else None,
+            # plume proximity
+            round(nearest_m, 1)   if nearest_m   is not None else None,
+            nearest_src,
+            round(max_flux_5km, 2) if max_flux_5km is not None else None,
             score,
         ))
 
@@ -239,22 +285,26 @@ def process_batch(wells: list[dict], county: str, cur,
               (api_no, county,
                ch4_well_ppb, ch4_background_ppb, ch4_anomaly_ratio, ch4_is_anomaly,
                thermal_well_c, thermal_background_c, thermal_anomaly_c,
+               nearest_plume_m, nearest_plume_source, max_plume_flux_kgph_5km,
                emissions_risk_score, emissions_processed_at)
             VALUES %s
             ON CONFLICT (api_no) DO UPDATE SET
-              county                 = EXCLUDED.county,
-              ch4_well_ppb           = EXCLUDED.ch4_well_ppb,
-              ch4_background_ppb     = EXCLUDED.ch4_background_ppb,
-              ch4_anomaly_ratio      = EXCLUDED.ch4_anomaly_ratio,
-              ch4_is_anomaly         = EXCLUDED.ch4_is_anomaly,
-              thermal_well_c         = EXCLUDED.thermal_well_c,
-              thermal_background_c   = EXCLUDED.thermal_background_c,
-              thermal_anomaly_c      = EXCLUDED.thermal_anomaly_c,
-              emissions_risk_score   = EXCLUDED.emissions_risk_score,
-              emissions_processed_at = NOW()
+              county                    = EXCLUDED.county,
+              ch4_well_ppb              = EXCLUDED.ch4_well_ppb,
+              ch4_background_ppb        = EXCLUDED.ch4_background_ppb,
+              ch4_anomaly_ratio         = EXCLUDED.ch4_anomaly_ratio,
+              ch4_is_anomaly            = EXCLUDED.ch4_is_anomaly,
+              thermal_well_c            = EXCLUDED.thermal_well_c,
+              thermal_background_c      = EXCLUDED.thermal_background_c,
+              thermal_anomaly_c         = EXCLUDED.thermal_anomaly_c,
+              nearest_plume_m           = EXCLUDED.nearest_plume_m,
+              nearest_plume_source      = EXCLUDED.nearest_plume_source,
+              max_plume_flux_kgph_5km   = EXCLUDED.max_plume_flux_kgph_5km,
+              emissions_risk_score      = EXCLUDED.emissions_risk_score,
+              emissions_processed_at    = NOW()
             """,
             rows,
-            template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())",
+            template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())",
         )
 
     return len(rows)
@@ -272,7 +322,6 @@ def main():
     ee.Initialize(project=os.getenv("GEE_PROJECT", "earthengine-legacy"))
     print("GEE connected.\n")
 
-    ch4_img = get_ch4_mean()
     conn = get_conn()
     total = 0
 
@@ -304,7 +353,7 @@ def main():
                     label = f"  Batch {i // BATCH_SIZE + 1:>3} ({len(batch)} wells)"
                     print(f"{label}…", end=" ", flush=True)
 
-                    saved = process_batch(batch, county, cur, ch4_img)
+                    saved = process_batch(batch, county, cur)
                     conn.commit()
                     total += saved
                     print(f"{saved} saved")
@@ -315,7 +364,8 @@ def main():
 
     print(f"\n✓ Done. Wells with emissions scores: {total:,}")
     print("\nTop emission candidates:")
-    print("  SELECT api_no, county, ch4_anomaly_ratio, thermal_anomaly_c, emissions_risk_score")
+    print("  SELECT api_no, county, nearest_plume_m, nearest_plume_source,")
+    print("         max_plume_flux_kgph_5km, thermal_anomaly_c, emissions_risk_score")
     print("  FROM well_remote_sensing")
     print("  WHERE emissions_risk_score >= 50")
     print("  ORDER BY emissions_risk_score DESC LIMIT 20;")

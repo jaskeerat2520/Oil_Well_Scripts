@@ -4,8 +4,11 @@ Score wells by population exposure using Census tract data.
 For each well, uses areal interpolation to estimate population within 1km and 5km:
 each tract's population is weighted by the fraction of its area that overlaps the
 buffer radius, preventing double-counting when two wells share the same tract.
-Also recalculates composite risk_score and priority after population scoring.
 Runs county-by-county to avoid timeouts.
+
+The composite score and priority are NOT recomputed here — that's the job of
+compute_composite.py, which folds all five risk dimensions together. Run
+compute_composite.py after this script to refresh priority.
 
 Prerequisites:
     - wells table populated
@@ -13,13 +16,15 @@ Prerequisites:
     - population_tracts table populated (run ingest_population.py first)
 
 Usage:
-    python score_population.py           # skip already-scored counties
-    python score_population.py --force   # re-score all counties
+    python score_population.py                  # all unscored counties
+    python score_population.py --county STARK   # one county only (Cloud Run worker mode)
+    python score_population.py --force          # re-score all counties
 """
 
 import os
 import sys
 import time
+import argparse
 import psycopg2
 from dotenv import load_dotenv
 
@@ -64,35 +69,12 @@ CROSS JOIN LATERAL (
             NULLIF(ST_Area(pt.geometry::geography), 0)
         ), 0)::integer AS pop_5km
     FROM population_tracts pt
-    WHERE ST_DWithin(w.geometry::geography, pt.geometry::geography, 5000)
+    WHERE ST_DWithin(w.geometry, pt.geometry, 0.06)
+      AND ST_DWithin(w.geometry::geography, pt.geometry::geography, 5000)
 ) pop
 WHERE wrs.api_no = w.api_no
   AND w.county = %s
   AND w.status NOT IN ('Plugged and Abandoned','Final Restoration','Storage Well','Active Injection','Well Permitted','Drilling');
-"""
-
-RISK_SQL = """
-UPDATE well_risk_scores r
-SET
-  risk_score = ROUND(
-    (0.25 * water_risk_score
-     + 0.35 * COALESCE(population_risk_score, 0)
-     + 0.40 * COALESCE(inactivity_score, 0))::numeric
-  , 1),
-  priority = CASE
-    WHEN w.status = 'Producing' AND (w.operator IS NULL OR w.operator != 'HISTORIC OWNER') THEN
-      CASE
-        WHEN (0.25 * water_risk_score + 0.35 * COALESCE(population_risk_score, 0) + 0.40 * COALESCE(inactivity_score, 0)) >= 35
-        THEN 'medium' ELSE 'low'
-      END
-    WHEN (0.25 * water_risk_score + 0.35 * COALESCE(population_risk_score, 0) + 0.40 * COALESCE(inactivity_score, 0)) >= 75 THEN 'critical'
-    WHEN (0.25 * water_risk_score + 0.35 * COALESCE(population_risk_score, 0) + 0.40 * COALESCE(inactivity_score, 0)) >= 55 THEN 'high'
-    WHEN (0.25 * water_risk_score + 0.35 * COALESCE(population_risk_score, 0) + 0.40 * COALESCE(inactivity_score, 0)) >= 35 THEN 'medium'
-    ELSE 'low'
-  END
-FROM wells w
-WHERE r.api_no = w.api_no
-  AND w.county = %s;
 """
 
 
@@ -107,12 +89,76 @@ def connect():
     return conn
 
 
-def run(force=False):
+def resolve_county_name(conn, county_input):
+    """Map a user-supplied county string to the canonical case-form stored in
+    `wells.county`. Returns None if no wells exist for the input.
+
+    Space-normalised so `enqueue_counties.sh` (which uses a bash array and can't
+    easily contain spaces) can send 'VANWERT' and still match the DB's
+    'VAN WERT'. Same handling for any future multi-word county."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT w.county
+            FROM wells w
+            JOIN well_risk_scores wrs ON w.api_no = wrs.api_no
+            WHERE UPPER(REPLACE(w.county, ' ', '')) = UPPER(REPLACE(%s, ' ', ''))
+            LIMIT 1
+        """, (county_input,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def already_scored(conn, county):
+    """Resume guard — true if any well in this county already has a nonzero
+    population_risk_score."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1
+            FROM well_risk_scores wrs
+            JOIN wells w ON w.api_no = wrs.api_no
+            WHERE w.county = %s
+              AND wrs.population_risk_score > 0
+            LIMIT 1
+        """, (county,))
+        return cur.fetchone() is not None
+
+
+def score_county(conn, county):
+    with conn.cursor() as cur:
+        cur.execute(SCORE_SQL, (county,))
+        count = cur.rowcount
+    conn.commit()
+    return count
+
+
+def run_one(county_input, force=False):
+    """Cloud Run worker entry — score a single county and exit."""
+    conn = connect()
+    start = time.time()
+    try:
+        county = resolve_county_name(conn, county_input)
+        if not county:
+            print(f"[ERROR] No wells found for county '{county_input}'")
+            sys.exit(1)
+
+        if not force and already_scored(conn, county):
+            print(f"[SKIP]  {county} already scored. Pass --force to re-score.")
+            return
+
+        count = score_county(conn, county)
+        elapsed = time.time() - start
+        print(f"[OK]    {county}: {count:,} wells scored in {elapsed:.1f}s")
+    finally:
+        conn.close()
+        print("[INFO]  Connection closed.")
+
+
+def run_all(force=False):
+    """Local batch entry — score every county (or every unscored one)."""
     conn = connect()
     start = time.time()
 
     try:
-        # Get all counties
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT DISTINCT w.county
@@ -145,17 +191,10 @@ def run(force=False):
         for i, county in enumerate(remaining, 1):
             county_start = time.time()
             try:
-                with conn.cursor() as cur:
-                    cur.execute(SCORE_SQL, (county,))
-                    count = cur.rowcount
-                with conn.cursor() as cur:
-                    cur.execute(RISK_SQL, (county,))
-                conn.commit()
-
+                count = score_county(conn, county)
                 elapsed = time.time() - county_start
                 scored_total += count
                 print(f"[{i:>3}/{len(remaining)}]  {county:<15} {count:>5} wells  {elapsed:.1f}s")
-
             except psycopg2.Error as e:
                 conn.rollback()
                 errors += 1
@@ -163,7 +202,6 @@ def run(force=False):
 
         elapsed = time.time() - start
 
-        # Final stats
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT
@@ -200,5 +238,13 @@ if __name__ == "__main__":
         print(f"[ERROR] Missing env vars: {', '.join(missing)}")
         sys.exit(1)
 
-    force = "--force" in sys.argv
-    run(force=force)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--county", help="Score only this county (Cloud Run worker mode)")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-score even if the county already has population scores")
+    args = parser.parse_args()
+
+    if args.county:
+        run_one(args.county, force=args.force)
+    else:
+        run_all(force=args.force)

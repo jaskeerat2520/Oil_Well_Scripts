@@ -20,7 +20,7 @@
 #          --role=roles/secretmanager.secretAccessor
 #
 # Usage:
-#   deploy_workers.sh [terrain | emissions | surface_anomalies | all]
+#   deploy_workers.sh [terrain | emissions | population | surface_anomalies | pad_detection | all]
 #
 # Default: all
 
@@ -68,13 +68,17 @@ deploy_service() {
 case "$TARGET" in
   terrain)           deploy_service terrain-worker           terrain_worker.py ;;
   emissions)         deploy_service emissions-worker         emissions_worker.py ;;
+  population)        deploy_service population-worker        population_worker.py ;;
   surface_anomalies) deploy_service surface-anomalies-worker surface_anomalies_worker.py ;;
+  pad_detection)     deploy_service pad-detection-worker     pad_detection_worker.py ;;
   all)
     deploy_service terrain-worker           terrain_worker.py
     deploy_service emissions-worker         emissions_worker.py
-    deploy_service surface-anomalies-worker surface_anomalies_worker.py ;;
+    deploy_service population-worker        population_worker.py
+    deploy_service surface-anomalies-worker surface_anomalies_worker.py
+    deploy_service pad-detection-worker     pad_detection_worker.py ;;
   *)
-    echo "Usage: $0 [terrain | emissions | surface_anomalies | all]"
+    echo "Usage: $0 [terrain | emissions | population | surface_anomalies | pad_detection | all]"
     exit 1 ;;
 esac
 

@@ -4,3 +4,8 @@ earthengine-api>=0.1.400,<2
 google-cloud-tasks==2.14.1
 google-cloud-secret-manager==2.16.4
 flask==3.0.0
+# pad-detection scorer dependencies (NAIP/OSIP fetch + GeoTIFF + projection)
+requests>=2.31
+tifffile>=2024.1
+pyproj>=3.6
+numpy>=1.26

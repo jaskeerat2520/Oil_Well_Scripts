@@ -11,13 +11,19 @@ FROM python:3.11-slim
   COPY requirements.txt .
   RUN pip install --no-cache-dir -r requirements.txt
 
-  COPY score_terrain.py .
-  COPY score_emissions.py .
-  COPY detect_surface_anomalies.py .
+# All scoring scripts that workers might subprocess-invoke
+COPY score_terrain.py .
+COPY score_emissions.py .
+COPY score_population.py .
+COPY score_pad_detection.py .
+COPY detect_surface_anomalies.py .
 
-  COPY terrain_worker.py .
-  COPY emissions_worker.py .
-  COPY surface_anomalies_worker.py .
+# All worker wrappers — the right one is selected at runtime via WORKER_SCRIPT
+COPY terrain_worker.py .
+COPY emissions_worker.py .
+COPY population_worker.py .
+COPY pad_detection_worker.py .
+COPY surface_anomalies_worker.py .
 
   ENV PYTHONUNBUFFERED=1
   ENV WORKER_SCRIPT=terrain_worker.py
