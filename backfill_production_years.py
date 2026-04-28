@@ -125,14 +125,21 @@ def recalculate_scores(conn):
         print(f"[OK]    years_inactive updated for {cur.rowcount:,} wells.")
 
         # Step 2: Recalculate inactivity_score from years_inactive.
-        # Producing wells get 0 regardless of years_inactive — their 1-2 year
-        # "idle" window is a reporting-lag artifact (last_nonzero_production_year
-        # is annual-resolution, RBDMS reports trail calendar time), not true
-        # dormancy. Scoring them as inactive would double-penalise active wells.
+        # Producing wells with recent production get 0 — the 1-2 year carveout
+        # absorbs the RBDMS reporting lag (last_nonzero_production_year is
+        # annual-resolution and RBDMS reports trail calendar time). The carveout
+        # is gated on production recency, not on Producing status alone. Zombie
+        # producers (Producing status with stale or null last_nonzero_production_year)
+        # fall through to the years_inactive buckets so they surface at their
+        # true dormancy. Distinct from the 5-year priority cap in
+        # compute_composite.py — that gate is for regulated-operator enforcement;
+        # this gate is for reporting-lag noise.
         cur.execute("""
             UPDATE well_risk_scores r
             SET inactivity_score = CASE
-                WHEN w.status = 'Producing' THEN 0
+                WHEN w.status = 'Producing'
+                     AND w.last_nonzero_production_year >= EXTRACT(YEAR FROM NOW())::int - 2
+                    THEN 0
                 WHEN r.years_inactive >= 50 THEN 100
                 WHEN r.years_inactive >= 25 THEN 80
                 WHEN r.years_inactive >= 15 THEN 60

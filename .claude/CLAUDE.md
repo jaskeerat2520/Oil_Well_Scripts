@@ -79,6 +79,8 @@ Four exclusion rules, all ANDed in the scoring WHERE clause:
 
 **Producing-cap revision** (2026-04-23): `status = 'Producing'` wells are capped at `medium` **only when** `last_nonzero_production_year >= 2020` (verified-active producers where enforcement runs through the operator). Zombie producers (Producing status + stale/null last_prod) are NOT capped — they're hidden orphans that should surface at their true composite rank. ~8,600 wells re-tiered upward.
 
+**Inactivity carveout fix** (2026-04-28): `inactivity_score` had a parallel bug in `backfill_production_years.py` — it zeroed out **every** `status = 'Producing'` well, fully neutralising the cap-removal above for 23,006 wells (14,612 deep zombies + 8,394 recent producers). The carveout is now explicitly gated on production recency: `Producing AND last_nonzero_production_year >= EXTRACT(YEAR FROM NOW())::int - 2 → 0`. The 2-year window absorbs the RBDMS reporting lag; zombies fall through to their `years_inactive` bucket. **Note the two distinct gates:** the priority cap above uses a 5-year window (regulated-operator distinction), the inactivity carveout uses a 2-year window (reporting-lag distinction). They serve different purposes and should not be unified. Re-tiered 3,263 wells out of `low`; +92 critical, +607 high.
+
 Historical note: `'Final Restoration'` was added earlier after discovery that 35,607 already-plugged wells were being scored (including 95 fake critical wells). "Final Restoration" = plugged + surface restored, more complete than P&A.
 
 ## Known Issues
