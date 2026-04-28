@@ -52,7 +52,18 @@ def run():
                     WHERE wrs.api_no = w.api_no
                       AND w.county = %s
                       AND wrs.within_protection_zone = false
-                      AND w.status NOT IN ('Plugged and Abandoned','Storage Well','Active Injection','Well Permitted','Drilling')
+                      AND w.status NOT IN ('Plugged and Abandoned','Final Restoration','Storage Well','Active Injection','Well Permitted','Drilling')
+                      AND w.plug_date IS NULL
+                      AND (w.well_type IS NULL OR w.well_type NOT IN (
+                          'Injection','Gas storage','Water supply','Solution mining',
+                          'Observation','Stratigraphy test','Lost hole','Brine for dust control',
+                          'Plugged injection','Plugged water supply'
+                      ))
+                      AND NOT (
+                          w.status IN ('Cancelled','Permit Expired')
+                          AND (w.completion_date IS NULL OR w.completion_date = '1900-01-02')
+                          AND w.last_nonzero_production_year IS NULL
+                      )
                 """, (county,))
                 updated = cur.rowcount
 

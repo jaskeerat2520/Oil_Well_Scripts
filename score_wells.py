@@ -14,6 +14,7 @@ Usage:
     python score_wells.py
 """
 
+import argparse
 import os
 import sys
 import time
@@ -22,6 +23,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Windows console default codepage (cp1252) can't encode the ─ separator used
+# in the stats summary. Force UTF-8 so the script exits 0 on Windows too.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, ValueError):
+    pass
+
+# Polygons larger than this (km²) are watershed-scale and not real wellhead
+# protection footprints — Ohio River + big inland surface_water polys average
+# 200–36,000 km². Excluding them drops zone coverage from 72.7% of Ohio to 3.6%.
+MAX_PROTECTION_ZONE_KM2 = 50
+
 # ── Config ────────────────────────────────────────────────────────────────────
 DB_HOST     = os.getenv("SUPABASE_DB_HOST")
 DB_NAME     = os.getenv("SUPABASE_DB_NAME", "postgres")
@@ -29,7 +42,7 @@ DB_USER     = os.getenv("SUPABASE_DB_USER", "postgres")
 DB_PASSWORD = os.getenv("SUPABASE_DB_PASSWORD")
 DB_PORT     = int(os.getenv("SUPABASE_DB_PORT", 5432))
 
-SCORE_SQL = """
+SCORE_SQL = f"""
 INSERT INTO well_risk_scores (api_no, nearest_water_source_id, nearest_water_distance_m,
     nearest_water_type, within_protection_zone, water_risk_score,
     has_operator, operator_status)
@@ -48,7 +61,7 @@ SELECT
             WHEN nearest.distance_m < 10000 THEN 15
             ELSE 5
         END
-        + CASE WHEN zone.intersects THEN 20 ELSE 0 END
+        + zone.bonus
     ),
     (w.operator IS NOT NULL AND w.operator != 'HISTORIC OWNER'),
     CASE
@@ -66,14 +79,46 @@ CROSS JOIN LATERAL (
     LIMIT 1
 ) nearest
 CROSS JOIN LATERAL (
-    SELECT EXISTS (
-        SELECT 1 FROM water_sources ws
-        WHERE ST_Intersects(w.geometry, ws.geometry)
-    ) AS intersects
+    -- Tiered protection-zone bonus by polygon type:
+    --   inner_management_zone         (~0.1 km²): +25  real wellhead protection
+    --   source_water_protection_area  (~0.7 km²): +10  broader recharge area
+    --   surface_water (lake/inland/river)        : +0   distance bucket already
+    --                                                   captures proximity, and
+    --                                                   the watershed polys are
+    --                                                   too large to be useful
+    -- Polygons larger than {MAX_PROTECTION_ZONE_KM2} km² are excluded entirely.
+    SELECT
+      COUNT(*) > 0 AS intersects,
+      COALESCE(MAX(
+        CASE ws.protection_zone
+          WHEN 'inner_management_zone'         THEN 25
+          WHEN 'source_water_protection_area' THEN 10
+          ELSE 0
+        END
+      ), 0) AS bonus
+    FROM water_sources ws
+    WHERE ws.area_km2 < {MAX_PROTECTION_ZONE_KM2}
+      AND ST_Intersects(w.geometry, ws.geometry)
 ) zone
 WHERE w.geometry IS NOT NULL
   AND w.county = %s
   AND w.status NOT IN ('Plugged and Abandoned','Final Restoration','Storage Well','Active Injection','Well Permitted','Drilling')
+  -- Physically plugged wells whose status lives in other buckets (Orphan Ready/Pending,
+  -- Field Inspected, etc.). plug_date is the authoritative signal.
+  AND w.plug_date IS NULL
+  -- Infrastructure well types that are not plugging candidates.
+  AND (w.well_type IS NULL OR w.well_type NOT IN (
+      'Injection','Gas storage','Water supply','Solution mining',
+      'Observation','Stratigraphy test','Lost hole','Brine for dust control',
+      'Plugged injection','Plugged water supply'
+  ))
+  -- Ghost permits: Cancelled/Permit Expired where no drilling ever occurred.
+  -- completion_date = '1900-01-02' is the DNR sentinel for "date unknown".
+  AND NOT (
+      w.status IN ('Cancelled','Permit Expired')
+      AND (w.completion_date IS NULL OR w.completion_date = '1900-01-02')
+      AND w.last_nonzero_production_year IS NULL
+  )
 ON CONFLICT (api_no) DO UPDATE SET
     nearest_water_source_id = EXCLUDED.nearest_water_source_id,
     nearest_water_distance_m = EXCLUDED.nearest_water_distance_m,
@@ -110,7 +155,7 @@ def connect():
         sys.exit(1)
 
 
-def run():
+def run(rescore: bool = False):
     conn = connect()
     start = time.time()
 
@@ -124,18 +169,20 @@ def run():
             """)
             counties = [row[0] for row in cur.fetchall()]
 
-        # Check which counties are already scored
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT DISTINCT w.county
-                FROM well_risk_scores wrs
-                JOIN wells w ON w.api_no = wrs.api_no
-                WHERE w.county IS NOT NULL
-            """)
-            already_scored = {row[0] for row in cur.fetchall()}
-
-        remaining = [c for c in counties if c not in already_scored]
-        print(f"[INFO]  {len(counties)} counties total, {len(already_scored)} already scored, {len(remaining)} remaining.")
+        if rescore:
+            remaining = counties
+            print(f"[INFO]  --rescore: forcing re-score of all {len(counties)} counties (UPSERT will overwrite).")
+        else:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT DISTINCT w.county
+                    FROM well_risk_scores wrs
+                    JOIN wells w ON w.api_no = wrs.api_no
+                    WHERE w.county IS NOT NULL
+                """)
+                already_scored = {row[0] for row in cur.fetchall()}
+            remaining = [c for c in counties if c not in already_scored]
+            print(f"[INFO]  {len(counties)} counties total, {len(already_scored)} already scored, {len(remaining)} remaining.")
 
         scored_total = 0
         errors = 0
@@ -185,9 +232,18 @@ def run():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Score wells against drinking-water protection zones.")
+    parser.add_argument(
+        "--rescore",
+        action="store_true",
+        help="Re-score every county, even ones already in well_risk_scores "
+             "(UPSERT overwrites). Use after changing the scoring SQL.",
+    )
+    args = parser.parse_args()
+
     print()
     print("=== Well Water Risk Scoring ===")
     print()
 
     validate_env()
-    run()
+    run(rescore=args.rescore)
