@@ -3,6 +3,13 @@ Backfill last_nonzero_production_year and last_production_quarter into the wells
 table from the original CSV, then recalculate years_inactive and inactivity_score
 in well_risk_scores.
 
+years_inactive is computed in two passes:
+  1. Primary: NOW() - last_nonzero_production_year (when production data exists).
+  2. Fallback: NOW() - completion_date_year (for wells where production data is
+     NULL but a real completion year exists). Skips the '1900-01-02' sentinel.
+     This catches the legacy 100+ year-old "Producing" wells from the early-1900s
+     Ohio oil boom that predate RBDMS electronic reporting.
+
 Composite risk_score and priority are NOT recalculated here — that's the job of
 compute_composite.py, which folds inactivity_score together with the other five
 risk dimensions. Run compute_composite.py after this script to refresh priority.
@@ -123,6 +130,30 @@ def recalculate_scores(conn):
               AND w.last_nonzero_production_year IS NOT NULL;
         """)
         print(f"[OK]    years_inactive updated for {cur.rowcount:,} wells.")
+
+        # Step 1b: Fallback to completion_date for wells with no production data.
+        # RBDMS electronic reporting started in the 1980s; legacy "Producing" and
+        # "Well Drilled" wells from the early-1900s Ohio oil boom have NULL
+        # last_nonzero_production_year but a real completion_date. For these,
+        # completion year is the only timestamp available — using it gives the
+        # correct ~100-year dormancy signal rather than the conservative score=50
+        # "unknown" bucket. The whole year 1900 is excluded as a sentinel zone:
+        # 148 wells share dates spread uniformly across Jan-Dec 1900, which is a
+        # systematically-generated-placeholder pattern, not real drilling
+        # (compare to ~6 wells/decade in adjacent years 1901-1919). Only fills
+        # NULL years_inactive — won't overwrite Step 1's values.
+        cur.execute("""
+            UPDATE well_risk_scores r
+            SET years_inactive = EXTRACT(YEAR FROM NOW())::int
+                               - EXTRACT(YEAR FROM w.completion_date)::int
+            FROM wells w
+            WHERE r.api_no = w.api_no
+              AND r.years_inactive IS NULL
+              AND w.last_nonzero_production_year IS NULL
+              AND w.completion_date IS NOT NULL
+              AND EXTRACT(YEAR FROM w.completion_date) > 1900;
+        """)
+        print(f"[OK]    years_inactive completion_date fallback: {cur.rowcount:,} wells.")
 
         # Step 2: Recalculate inactivity_score from years_inactive.
         # Producing wells with recent production get 0 — the 1-2 year carveout
