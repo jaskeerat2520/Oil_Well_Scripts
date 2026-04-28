@@ -1,16 +1,19 @@
 """
 compute_composite.py
 
-Merges all five risk dimensions into a single composite score + priority
+Merges all six risk dimensions into a single composite score + priority
 for every well in well_risk_scores.
 
 Dimensions and default weights:
 
-  water_risk_score        30%   (existing — distance to protection zones)
-  population_risk_score   20%   (existing — human exposure)
+  water_risk_score        25%   (distance to protection zones)
+  population_risk_score   15%   (human exposure within 1km / 5km buffers)
   vegetation_risk_score   20%   (derived from NDVI trend + NDMI change + anomaly)
   terrain_risk_score      10%   (from well_remote_sensing — artificial pad flatness)
-  emissions_risk_score    20%   (from well_remote_sensing — CH4 + thermal)
+  emissions_risk_score    20%   (from well_remote_sensing — plumes + thermal)
+  inactivity_score        10%   (from well_risk_scores — years_inactive bucketing
+                                 set by backfill_production_years.py; 0 for
+                                 Producing wells by design)
 
 Missing components are handled by renormalizing: the weights of the *available*
 dimensions sum to 100% for each well, so partial-data wells are scored fairly
@@ -40,6 +43,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Windows console default codepage (cp1252) can't encode the ─ separator used in
+# the stats summary. Force UTF-8 so the script exits 0 on Windows too.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, ValueError):
+    pass
+
 DB_HOST     = os.getenv("SUPABASE_DB_HOST")
 DB_NAME     = os.getenv("SUPABASE_DB_NAME", "postgres")
 DB_USER     = os.getenv("SUPABASE_DB_USER", "postgres")
@@ -52,8 +62,10 @@ WITH dims AS (
   SELECT
     wrs.api_no,
     w.status,
+    w.last_nonzero_production_year,
     wrs.water_risk_score,
     wrs.population_risk_score,
+    wrs.inactivity_score,
 
     -- Vegetation: combine the binary NDVI anomaly score with the slope of
     -- the multi-year trend and any NDMI decline.
@@ -87,26 +99,28 @@ WITH dims AS (
 ),
 scored AS (
   SELECT
-    api_no, status,
-    water_risk_score, population_risk_score,
+    api_no, status, last_nonzero_production_year,
+    water_risk_score, population_risk_score, inactivity_score,
     vegetation_score, terrain_score, emissions_score,
     -- Weighted sum (zeros for NULL, numerator only)
-    (COALESCE(water_risk_score,      0) * 0.30
-   + COALESCE(population_risk_score, 0) * 0.20
+    (COALESCE(water_risk_score,      0) * 0.25
+   + COALESCE(population_risk_score, 0) * 0.15
    + COALESCE(vegetation_score,      0) * 0.20
    + COALESCE(terrain_score,         0) * 0.10
-   + COALESCE(emissions_score,       0) * 0.20) AS weighted_sum,
+   + COALESCE(emissions_score,       0) * 0.20
+   + COALESCE(inactivity_score,      0) * 0.10) AS weighted_sum,
     -- Sum of weights for *present* dimensions only — normalizer
-    ( (CASE WHEN water_risk_score      IS NOT NULL THEN 0.30 ELSE 0 END)
-    + (CASE WHEN population_risk_score IS NOT NULL THEN 0.20 ELSE 0 END)
+    ( (CASE WHEN water_risk_score      IS NOT NULL THEN 0.25 ELSE 0 END)
+    + (CASE WHEN population_risk_score IS NOT NULL THEN 0.15 ELSE 0 END)
     + (CASE WHEN vegetation_score      IS NOT NULL THEN 0.20 ELSE 0 END)
     + (CASE WHEN terrain_score         IS NOT NULL THEN 0.10 ELSE 0 END)
-    + (CASE WHEN emissions_score       IS NOT NULL THEN 0.20 ELSE 0 END) ) AS weights_present
+    + (CASE WHEN emissions_score       IS NOT NULL THEN 0.20 ELSE 0 END)
+    + (CASE WHEN inactivity_score      IS NOT NULL THEN 0.10 ELSE 0 END) ) AS weights_present
   FROM dims
 ),
 final AS (
   SELECT
-    api_no, status,
+    api_no, status, last_nonzero_production_year,
     vegetation_score, terrain_score, emissions_score,
     CASE
       WHEN weights_present > 0 THEN weighted_sum / weights_present
@@ -121,12 +135,16 @@ SET
   emissions_risk_score  = f.emissions_score,
   composite_risk_score  = f.composite,
   priority = CASE
-    -- Producers capped at medium regardless of composite
-    WHEN f.status = 'Producing' THEN
+    -- Verified-active producers (recent production) stay capped at medium —
+    -- these are regulated operations where enforcement runs through the
+    -- operator, not the state plugging fund.
+    WHEN f.status = 'Producing' AND f.last_nonzero_production_year >= 2020 THEN
       CASE
         WHEN f.composite >= 25 THEN 'medium'
         ELSE 'low'
       END
+    -- Zombie / paperwork producers (Producing status with stale or null
+    -- production) are hidden orphans and should NOT be capped.
     WHEN f.composite >= 45 THEN 'critical'
     WHEN f.composite >= 35 THEN 'high'
     WHEN f.composite >= 25 THEN 'medium'

@@ -1,7 +1,11 @@
 """
-Backfill last_nonzero_production_year and last_production_quarter into the wells table
-from the original CSV, then recalculate years_inactive, inactivity_score,
-risk_score, and priority in well_risk_scores.
+Backfill last_nonzero_production_year and last_production_quarter into the wells
+table from the original CSV, then recalculate years_inactive and inactivity_score
+in well_risk_scores.
+
+Composite risk_score and priority are NOT recalculated here — that's the job of
+compute_composite.py, which folds inactivity_score together with the other five
+risk dimensions. Run compute_composite.py after this script to refresh priority.
 
 Usage:
     python backfill_production_years.py
@@ -142,32 +146,8 @@ def recalculate_scores(conn):
         """)
         print(f"[OK]    inactivity_score recalculated for {cur.rowcount:,} wells.")
 
-        # Step 3: Recalculate risk_score and priority
-        cur.execute("""
-            UPDATE well_risk_scores r
-            SET
-              risk_score = ROUND(
-                (0.25 * water_risk_score
-                 + 0.35 * COALESCE(population_risk_score, 0)
-                 + 0.40 * COALESCE(inactivity_score, 0))::numeric
-              , 1),
-              priority = CASE
-                WHEN w.status = 'Producing' THEN
-                  CASE
-                    WHEN (0.25 * water_risk_score + 0.35 * COALESCE(population_risk_score, 0) + 0.40 * COALESCE(inactivity_score, 0)) >= 35
-                    THEN 'medium' ELSE 'low'
-                  END
-                WHEN (0.25 * water_risk_score + 0.35 * COALESCE(population_risk_score, 0) + 0.40 * COALESCE(inactivity_score, 0)) >= 75 THEN 'critical'
-                WHEN (0.25 * water_risk_score + 0.35 * COALESCE(population_risk_score, 0) + 0.40 * COALESCE(inactivity_score, 0)) >= 55 THEN 'high'
-                WHEN (0.25 * water_risk_score + 0.35 * COALESCE(population_risk_score, 0) + 0.40 * COALESCE(inactivity_score, 0)) >= 35 THEN 'medium'
-                ELSE 'low'
-              END
-            FROM wells w
-            WHERE r.api_no = w.api_no;
-        """)
-        print(f"[OK]    risk_score + priority recalculated for {cur.rowcount:,} wells.")
-
     conn.commit()
+    print("[INFO]  Run compute_composite.py to refresh composite risk_score + priority.")
 
 
 def print_summary(conn):
