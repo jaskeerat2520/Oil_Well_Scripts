@@ -33,6 +33,8 @@ Usage:
 """
 
 import os
+from datetime import date
+
 import uvicorn
 import ee
 from fastapi import FastAPI, Query, HTTPException
@@ -52,8 +54,13 @@ app.add_middleware(
 GEE_PROJECT = os.getenv("GEE_PROJECT", "earthengine-legacy")
 
 # ── Date windows ───────────────────────────────────────────────────────────────
-S2_BASELINE_START = "2016-05-01"
-S2_BASELINE_END   = "2016-10-31"
+# 2017-2018 stitched (2 growing seasons). 2016 SR_HARMONIZED coverage is too
+# thin in Ohio — many tiles had <8 cloud-free acquisitions, so s2_median
+# returned None and the UI rendered "No clear pixels". Two seasons of medians
+# gives reliable coverage everywhere; well-pad disturbance is decadal so a
+# 1-year shift in "pre" doesn't change what's detected.
+S2_BASELINE_START = "2017-05-01"
+S2_BASELINE_END   = "2018-10-31"
 S2_RECENT_START   = "2023-05-01"
 S2_RECENT_END     = "2024-10-31"
 
@@ -67,7 +74,10 @@ LS_RECENT_START   = "2023-04-01"
 LS_RECENT_END     = "2024-10-31"
 
 BUFFER_M       = 500
-THUMB_SIZE     = 768
+# Sentinel-2 native bands are 10m (B2/B3/B4/B8) or 20m (B11/B12), so the 1400m
+# thumb region (THUMB_REGION_M*2) only carries ~140 real pixels of detail. Output
+# at 1280 + bicubic resampling so the upsample looks smooth rather than blocky.
+THUMB_SIZE     = 1280
 THUMB_REGION_M = 700
 METHANE_BG_KM  = 10
 
@@ -98,7 +108,10 @@ def s2_median(region: ee.Geometry, start: str, end: str) -> ee.Image | None:
     col = s2_collection(region, start, end)
     if col.size().getInfo() == 0:
         return None
-    return col.median()
+    # bicubic so the 10m native pixels don't show up as blocks when getThumbURL
+    # upsamples to THUMB_SIZE. resample() applies during reprojection only, so
+    # mean_index() reduceRegion calls (scale=20) are barely affected.
+    return col.median().resample('bicubic')
 
 
 def thumb(img: ee.Image, region: ee.Geometry, bands: list[str],
@@ -185,14 +198,16 @@ def methane_anomaly(point: ee.Geometry, bg_region: ee.Geometry) -> dict:
     }
 
 
-# ── Terrain (USGS NED 10 m) ────────────────────────────────────────────────────
+# ── Terrain (USGS 3DEP 10 m) ───────────────────────────────────────────────────
 def terrain_analysis(point: ee.Geometry, buffer_m: int = 300) -> dict:
     """
     Returns mean slope and terrain roughness (std dev of elevation) within buffer.
     Low mean slope + low roughness vs. surrounding area = likely artificial grading.
     Also generates a hillshade thumbnail.
     """
-    dem = ee.Image("USGS/NED")
+    # USGS/NED was deprecated in favor of the tiled USGS/3DEP/10m_collection;
+    # .mosaic() flattens the per-tile ImageCollection into a single virtual image.
+    dem = ee.ImageCollection("USGS/3DEP/10m_collection").mosaic().select("elevation")
     region   = point.buffer(buffer_m)
     surround = point.buffer(buffer_m * 4)  # wider area for context
 
@@ -234,8 +249,16 @@ def terrain_analysis(point: ee.Geometry, buffer_m: int = 300) -> dict:
 # ── Thumbnail endpoint (all four analyses) ─────────────────────────────────────
 @app.get("/thumbnails")
 def thumbnails(
-    lat: float = Query(..., ge=38.0, le=42.5),
-    lng: float = Query(..., ge=-85.0, le=-80.0),
+    lat: float = Query(..., ge=24.0, le=50.0),
+    lng: float = Query(..., ge=-125.0, le=-66.0),
+    # Baseline is the 2017-2018 stitched median; floor recent_year at 2019 so the
+    # gap is at least 1 year and the recent window doesn't overlap the baseline.
+    # Cap at last fully-completed growing season (current year - 1).
+    recent_year: int = Query(
+        date.today().year - 1,
+        ge=2019,
+        le=date.today().year - 1,
+    ),
 ):
     """
     Returns thumbnail URLs and scores for all four environmental analyses.
@@ -251,14 +274,17 @@ def thumbnails(
     region       = point.buffer(BUFFER_M)
     thumb_region = point.buffer(THUMB_REGION_M)
 
+    recent_start = f"{recent_year}-05-01"
+    recent_end   = f"{recent_year}-10-31"
+
     # Build baseline and recent Sentinel-2 composites once — reuse for all indices
     baseline = s2_median(thumb_region, S2_BASELINE_START, S2_BASELINE_END)
-    recent   = s2_median(thumb_region, S2_RECENT_START,   S2_RECENT_END)
+    recent   = s2_median(thumb_region, recent_start,      recent_end)
 
     result: dict = {
-        "baseline_year": "2016",
-        "recent_year":   "2023–24",
-        "gap_years":     8,
+        "baseline_year": "2017–18",
+        "recent_year":   str(recent_year),
+        "gap_years":     recent_year - 2017,
     }
 
     # ── 1. True colour ─────────────────────────────────────────────────────────
@@ -267,8 +293,11 @@ def thumbnails(
         "recent_url":   thumb(recent,   thumb_region, ["B4","B3","B2"], 200, 2800, gamma=1.4) if recent   else None,
     }
 
-    # ── 2. NDVI — vegetation ghost ─────────────────────────────────────────────
-    ndvi_palette = ["7f0000","b71c1c","ef5350","ffee58","66bb6a","2e7d32","1b5e20"]
+    # ── 2. NDVI — numeric only ─────────────────────────────────────────────────
+    # Frontend renders only the true-color photo above; NDVI false-color tiles
+    # were dropped because two near-saturated greens carry less actionable
+    # signal than the actual RGB scene. We still compute the means here so the
+    # header text can show "NDVI 0.78 → 0.74" and label the anomaly type.
     ndvi_b = baseline.normalizedDifference(["B8","B4"]).rename("NDVI") if baseline else None
     ndvi_r = recent.normalizedDifference(["B8","B4"]).rename("NDVI")   if recent   else None
 
@@ -278,8 +307,6 @@ def thumbnails(
     ndvi_relative    = round(ndvi_change / ndvi_base_mean, 4) if (ndvi_change and ndvi_base_mean and ndvi_base_mean > 0.1) else None
 
     result["ndvi"] = {
-        "baseline_url":  thumb(ndvi_b, thumb_region, ["NDVI"], -0.1, 0.85, palette=ndvi_palette) if ndvi_b else None,
-        "recent_url":    thumb(ndvi_r, thumb_region, ["NDVI"], -0.1, 0.85, palette=ndvi_palette) if ndvi_r else None,
         "baseline_mean": ndvi_base_mean,
         "recent_mean":   ndvi_recent_mean,
         "change":        ndvi_change,
@@ -326,8 +353,8 @@ def thumbnails(
 # ── Full analysis endpoint (NDVI + methane scores, no thumbnails) ──────────────
 @app.get("/analyze")
 def analyze(
-    lat: float = Query(..., ge=38.0, le=42.5),
-    lng: float = Query(..., ge=-85.0, le=-80.0),
+    lat: float = Query(..., ge=24.0, le=50.0),
+    lng: float = Query(..., ge=-125.0, le=-66.0),
 ):
     try:
         init_ee()

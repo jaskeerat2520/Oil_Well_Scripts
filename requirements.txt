@@ -9,3 +9,6 @@ requests>=2.31
 tifffile>=2024.1
 pyproj>=3.6
 numpy>=1.26
+# mapbox tilesets pipeline (export_wells_ldgeojson.py, prep_oilgas_ldgeojson.py)
+mapbox-tilesets>=1.13
+ijson>=3.2

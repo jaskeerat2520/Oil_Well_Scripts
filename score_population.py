@@ -74,7 +74,8 @@ CROSS JOIN LATERAL (
 ) pop
 WHERE wrs.api_no = w.api_no
   AND w.county = %s
-  AND w.status NOT IN ('Plugged and Abandoned','Final Restoration','Storage Well','Active Injection','Well Permitted','Drilling');
+  AND w.status NOT IN ('Plugged and Abandoned','Final Restoration','Storage Well','Active Injection','Well Permitted','Drilling')
+  AND (%s OR wrs.population_risk_score = 0);
 """
 
 
@@ -108,24 +109,27 @@ def resolve_county_name(conn, county_input):
         return row[0] if row else None
 
 
-def already_scored(conn, county):
-    """Resume guard — true if any well in this county already has a nonzero
-    population_risk_score."""
+def has_unscored_wells(conn, county):
+    """Resume guard — true if at least one *well* in this county still has
+    population_risk_score = 0. Per-well, not per-county: new orphans added to
+    a previously-scored county are detected and re-scored, instead of being
+    silently skipped because the county once contained a scored row."""
     with conn.cursor() as cur:
         cur.execute("""
             SELECT 1
             FROM well_risk_scores wrs
             JOIN wells w ON w.api_no = wrs.api_no
             WHERE w.county = %s
-              AND wrs.population_risk_score > 0
+              AND wrs.population_risk_score = 0
+              AND w.status NOT IN ('Plugged and Abandoned','Final Restoration','Storage Well','Active Injection','Well Permitted','Drilling')
             LIMIT 1
         """, (county,))
         return cur.fetchone() is not None
 
 
-def score_county(conn, county):
+def score_county(conn, county, force=False):
     with conn.cursor() as cur:
-        cur.execute(SCORE_SQL, (county,))
+        cur.execute(SCORE_SQL, (county, force))
         count = cur.rowcount
     conn.commit()
     return count
@@ -141,11 +145,11 @@ def run_one(county_input, force=False):
             print(f"[ERROR] No wells found for county '{county_input}'")
             sys.exit(1)
 
-        if not force and already_scored(conn, county):
-            print(f"[SKIP]  {county} already scored. Pass --force to re-score.")
+        if not force and not has_unscored_wells(conn, county):
+            print(f"[SKIP]  {county} has no unscored wells. Pass --force to re-score.")
             return
 
-        count = score_county(conn, county)
+        count = score_county(conn, county, force=force)
         elapsed = time.time() - start
         print(f"[OK]    {county}: {count:,} wells scored in {elapsed:.1f}s")
     finally:
@@ -173,17 +177,22 @@ def run_all(force=False):
             remaining = counties
             print(f"[INFO]  --force: re-scoring all {len(counties)} counties.")
         else:
+            # Per-well guard: a county is "remaining" if it has at least one
+            # well still at population_risk_score = 0, regardless of whether
+            # other wells in the same county are already scored. This catches
+            # new orphans added to previously-completed counties.
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT DISTINCT w.county
                     FROM well_risk_scores wrs
                     JOIN wells w ON w.api_no = wrs.api_no
-                    WHERE wrs.population_risk_score > 0
-                      AND w.county IS NOT NULL
+                    WHERE w.county IS NOT NULL
+                      AND wrs.population_risk_score = 0
+                      AND w.status NOT IN ('Plugged and Abandoned','Final Restoration','Storage Well','Active Injection','Well Permitted','Drilling')
                 """)
-                already_done = {row[0] for row in cur.fetchall()}
-            remaining = [c for c in counties if c not in already_done]
-            print(f"[INFO]  {len(counties)} counties total, {len(already_done)} already scored, {len(remaining)} remaining.")
+                pending = {row[0] for row in cur.fetchall()}
+            remaining = [c for c in counties if c in pending]
+            print(f"[INFO]  {len(counties)} counties total, {len(remaining)} with unscored wells, {len(counties) - len(remaining)} fully scored.")
 
         scored_total = 0
         errors = 0
@@ -191,7 +200,7 @@ def run_all(force=False):
         for i, county in enumerate(remaining, 1):
             county_start = time.time()
             try:
-                count = score_county(conn, county)
+                count = score_county(conn, county, force=force)
                 elapsed = time.time() - county_start
                 scored_total += count
                 print(f"[{i:>3}/{len(remaining)}]  {county:<15} {count:>5} wells  {elapsed:.1f}s")

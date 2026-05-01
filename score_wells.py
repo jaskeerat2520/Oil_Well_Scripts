@@ -53,15 +53,26 @@ SELECT
     nearest.source_type,
     zone.intersects,
     LEAST(100,
-        CASE
-            WHEN nearest.distance_m < 500   THEN 90
-            WHEN nearest.distance_m < 1000  THEN 70
-            WHEN nearest.distance_m < 3000  THEN 50
-            WHEN nearest.distance_m < 5000  THEN 30
-            WHEN nearest.distance_m < 10000 THEN 15
-            ELSE 5
-        END
-        + zone.bonus
+        GREATEST(
+            CASE
+                WHEN nearest.distance_m < 500   THEN 90
+                WHEN nearest.distance_m < 1000  THEN 70
+                WHEN nearest.distance_m < 3000  THEN 50
+                WHEN nearest.distance_m < 5000  THEN 30
+                WHEN nearest.distance_m < 10000 THEN 15
+                ELSE 5
+            END
+            + zone.bonus,
+            -- Physical-water-contact floor. SWAP only covers regulator-designated
+            -- drinking-water zones; many Ohio lakes (Grand Lake St. Marys, etc.)
+            -- aren't on that list. A well sitting IN water is a contamination
+            -- vector regardless of regulatory status.
+            CASE w.land_cover
+                WHEN 80 THEN 100   -- permanent water body
+                WHEN 90 THEN 70    -- herbaceous wetland
+                ELSE 0
+            END
+        )
     ),
     (w.operator IS NOT NULL AND w.operator != 'HISTORIC OWNER'),
     CASE

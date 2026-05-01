@@ -5,6 +5,25 @@ Identifies and prioritizes Ohio oil/gas wells that need plugging based on enviro
 Combines water source proximity, population exposure, vegetation stress, terrain anomalies,
 and emission signals (methane + thermal) into a composite risk score.
 
+## Multi-State Expansion (PoC, 2026-04-29)
+
+`wells`, `counties`, and `well_risk_scores` now carry a `state_code CHAR(2) NOT NULL` column. Existing 242k Ohio rows are backfilled to `'OH'`. Migration: `005_state_code.sql`.
+
+**Scope of the PoC**: import wells for Pennsylvania and West Virginia alongside Ohio so the schema can be validated before extending the scoring pipeline. **Risk scoring (water/population/vegetation/terrain/emissions) is OH-only**. PA and WV wells exist in `wells` but have no rows in `well_risk_scores`, `well_surface_anomalies`, or `well_remote_sensing`.
+
+- `import_wells_pa.py` — PA DEP MapServer layer 3 (`gis.dep.pa.gov/.../OilGasAllStrayGasEGSP/MapServer/3`), ~223k wells
+- `import_wells_wv.py` — WV TAGIS MapServer layer 7 (`tagis.dep.wv.gov/.../oil_gas/MapServer/7`), ~153k wells
+- `import_county_geometry.py --state PA|WV|OH` — generalised; upserts on `fips_code` (5-digit FIPS PK), so re-running is safe
+- `005_state_code.sql` — schema migration (applied)
+
+**api_no namespacing**: Ohio's existing `api_no` values include short legacy codes ("8", "37") that would collide with PA/WV native ID values. PA wells use `api_no = "PA-<PERMIT_NUMBER>"`; WV wells use `api_no = "WV-<api>"`. Ohio rows are unchanged. State of the well is also recorded in `state_code`.
+
+**Status vocabularies are state-specific**. PA values: `'DEP Orphan List'`, `'DEP Abandoned List'`, `'Plugged OG Well'`, `'Cannot Be Located'`, etc. WV values: `'Active Well'`, `'Abandoned Well'`, `'Plugged'`, `'Shutin'`, etc. The Ohio RBDMS exclusion lists in `score_wells.py` (`'Plugged and Abandoned'`, `'Final Restoration'`, etc.) do **not** apply to PA or WV. When extending scoring, replace the literal status lists with a per-state config dict, or normalise to a `well_lifecycle_state` enum at ingest.
+
+**Frontend**: minimal `/states/[state]/page.tsx` lists imported wells and counts by status/county for OH/PA/WV. The full `/counties/...` Ohio map and per-county briefs are unchanged and remain Ohio-only. Restructuring `/counties/[county]` under `/states/[state]/counties/[county]` is deferred — it requires reworking `WellMap`, `useMapInit`, `mapStore`, the OSIP tile layer, and ~10 supabase view queries that key on `county` (name) without state context.
+
+**Satellite microservice**: `satellite_service.py` lat/lng validators relaxed from Ohio-only `(38, 42.5)/(-85, -80)` to USA-wide `(24, 50)/(-125, -66)`.
+
 ## Tech Stack
 - **Database**: Supabase PostgreSQL with PostGIS (project: `fdehtiqlmijdnfxzjufi`)
 - **Language**: Python 3 with psycopg2 (direct connections, not Supabase client)
@@ -24,6 +43,8 @@ and emission signals (methane + thermal) into a composite risk score.
 | `well_surface_anomalies` | up to 130K | Sentinel-2 NDVI/NDMI/NDWI/NBR baseline vs recent + yearly NDVI trend slope |
 | `well_remote_sensing` | up to 130K | 3DEP terrain (slope ratio, artificial flatness) + Sentinel-5P CH4 + Landsat 9 thermal |
 | `parcels` | 5,836,675 (statewide) | Surface-owner parcel polygons from county auditor ArcGIS Online tenants. Includes `owner_mailing_address`/`city`/`state`/`zip` columns (populated for most counties; coverage varies). GIST index `parcels_geom_gist` on `geom`; map UI fetches via `parcels_in_bbox(w,s,e,n,lim)` RPC. |
+| `schools` | 3,682 | Ohio public schools (point geometry) from ODE 2021-2022 layer. Includes `name`, `district`, `school_type`, `external_id` (ORG_IRN), `raw_attrs` JSONB. GIST index on `geometry`. Used for nearest-school proximity scoring on well_risk_scores. |
+| `hospitals` | 255 (230 with geometry) | Ohio hospitals (point geometry) from ODH 2023 Hospital Registration Information CSV. Includes `name`, `address/city/zip/county`, `medicare_classification`, `service_category`, `trauma_level_adult/pediatric`, `registered_beds`, `raw_attrs` JSONB. Geocoded via US Census Bureau onelineaddress endpoint (90% match rate). Used for nearest-hospital proximity scoring on well_risk_scores. |
 
 Note: `oil_gas_wells` (raw CSV staging) was dropped after ETL completed. Re-create with `import_wells.py` if needed.
 
@@ -42,6 +63,10 @@ Views: `orphan_candidates`, `county_summary`, `well_admin_status` (operational c
 10. `score_terrain.py` — USGS 3DEP slope-ratio artificial-pad detection -> `well_remote_sensing`
 11. `score_emissions.py` — Sentinel-5P CH4 + Landsat 9 thermal anomalies -> `well_remote_sensing`
 12. `compute_composite.py` — Weighted merge of all five dimensions + priority assignment -> `well_risk_scores`
+13. `ingest_schools.py` — Ohio Dept of Education ODE_Layers/MapServer layer 0 (Public Schools 2021-2022) -> `schools` table. Uses runtime field discovery + flexible name mapping (raw_attrs JSONB preserves all original fields). Run via `--list-layers` first to see available layers, then default `--layer-id 0` for schools.
+14. `score_schools.py` — KNN nearest physical-presence school per well -> `well_risk_scores.nearest_school_id/distance_m/name`. Tier 1 (informational only); excludes Online and Educational Service Center types. **Does NOT touch composite_risk_score** — to add proximity to composite scoring, edit composite formula or boost population_risk_score in score_population.py for wells under threshold distance.
+15. `ingest_hospitals.py` — Reads `Hospital_Registration_Information.csv` (ODH), filters to report_year=2023 + Approved by ODH, dedupes to one row per hospital_number (sums registered_beds across beds_category rows), geocodes each address via US Census Bureau onelineaddress endpoint (~5 min for 255 hospitals at 0.4s sleep), upserts into `hospitals` table. 230/255 (90%) geocoded; 25 ungeocoded recoverable later via hand-fix.
+16. `score_hospitals.py` — KNN nearest hospital per well -> `well_risk_scores.nearest_hospital_id/distance_m/name`. Tier 1 (informational only). Statewide stats: 74 wells within 500m, 316 within 1km of a hospital. **Does NOT touch composite_risk_score**.
 
 `satellite_service.py` is a standalone FastAPI microservice (port 8001) for on-demand per-well analysis + thumbnail URLs — used by the frontend, not part of the batch pipeline.
 `view_anomaly.py` is an ad-hoc tool that opens a local HTML page with Sentinel-2 before/after thumbnails for flagged wells.
@@ -89,7 +114,7 @@ Historical note: `'Final Restoration'` was added earlier after discovery that 35
 - Large counties can timeout on spatial queries — use longer `statement_timeout` or batch further
 
 ## Scoring System
-- **Water risk** (0-100, weight 25%): Distance bucket to nearest water source (KNN against `water_source_centroids`) plus a tiered protection-zone bonus. Distance buckets: <500m → 90, <1000m → 70, <3000m → 50, <5000m → 30, <10000m → 15, else 5. Zone bonus by `protection_zone` type: `inner_management_zone` (~0.1 km² avg) +25, `source_water_protection_area` (~0.7 km² avg) +10, `surface_water` 0. **Polygons larger than 50 km² are excluded entirely** — Ohio River + huge inland watershed polygons covered 72% of Ohio's land area, so the original binary `+20 if intersects` flag fired for 89% of wells (no signal). After the size filter and the type tiers, only ~1–5% of wells are flagged "within zone." `water_sources.area_km2` is precomputed (geographic ST_Area / 1e6) and indexed; the SQL filters on the column rather than computing area inline. See `score_wells.py` for the SQL.
+- **Water risk** (0-100, weight 25%): Distance bucket to nearest water source (KNN against `water_source_centroids`) plus a tiered protection-zone bonus. Distance buckets: <500m → 90, <1000m → 70, <3000m → 50, <5000m → 30, <10000m → 15, else 5. Zone bonus by `protection_zone` type: `inner_management_zone` (~0.1 km² avg) +25, `source_water_protection_area` (~0.7 km² avg) +10, `surface_water` 0. **Polygons larger than 50 km² are excluded entirely** — Ohio River + huge inland watershed polygons covered 72% of Ohio's land area, so the original binary `+20 if intersects` flag fired for 89% of wells (no signal). After the size filter and the type tiers, only ~1–5% of wells are flagged "within zone." `water_sources.area_km2` is precomputed (geographic ST_Area / 1e6) and indexed; the SQL filters on the column rather than computing area inline. **Physical-water-contact floor** (added 2026-04-29): SWAP only covers regulator-designated drinking-water zones; many Ohio lakes (Grand Lake St. Marys, etc.) aren't on that list, so wells sitting *in* them previously scored low. The score expression is now `LEAST(100, GREATEST(distance_bucket + zone_bonus, lc_floor))` where `lc_floor = 100` for `wells.land_cover = 80` (permanent water body) and `70` for `land_cover = 90` (herbaceous wetland), else 0. Re-tiered Grand Lake St. Marys' 66 historic-owner wells from 61 low/5 medium → 62 high/4 medium. See `score_wells.py` for the SQL. Requires `score_land_cover.py` to have run first; wells without `land_cover` set fall back to the original distance-only logic.
 - **Population risk** (0-100, weight 15%): Population within 1km and 5km of well (Census 2020 tracts).
 - **Vegetation risk** (0-100, weight 20%): Combines NDVI baseline-vs-recent anomaly + multi-year NDVI trend slope (2017-2024) + NDMI brine/salt stress delta. Cropland and built-up masked out via ESA WorldCover 2021.
 - **Terrain risk** (0-100, weight 10%): Ratio of mean slope inside 100m well buffer vs 400m surroundings, derived from USGS 3DEP 10m DEM. `is_artificially_flat = true` when bg slope > 1° AND ratio < 0.4.

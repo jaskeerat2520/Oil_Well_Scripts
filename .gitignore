@@ -3,3 +3,8 @@ well-viewer/
 __pycache__/
 *.pyc
 .env
+OilGasLocations_*.geojson
+crypto_transaction_summary.csv
+logs/
+tile-cache/
+tilesets/

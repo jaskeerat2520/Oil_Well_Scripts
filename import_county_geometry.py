@@ -1,5 +1,16 @@
+"""
+Import county boundary polygons from the US Census Bureau into the `counties` table.
+
+Defaults to Ohio for backwards compatibility, but accepts --state to load county
+geometry for any US state. Use --state PA or --state WV to add Pennsylvania or
+West Virginia counties for the multi-state expansion. Upserts on fips_code so
+re-running for the same state refreshes geometry without creating duplicates.
+"""
+
+import argparse
 import os
 import sys
+
 import psycopg2
 from dotenv import load_dotenv
 
@@ -43,10 +54,10 @@ def connect():
         sys.exit(1)
 
 
-def fetch_county_boundaries():
+def fetch_county_boundaries(state_code: str):
     import pygris
-    print("[INFO]  Fetching Ohio county boundaries from Census Bureau via pygris …")
-    gdf = pygris.counties(state="OH", year=2023)
+    print(f"[INFO]  Fetching {state_code} county boundaries from Census Bureau via pygris …")
+    gdf = pygris.counties(state=state_code, year=2023)
     print(f"[OK]    Fetched {len(gdf)} county features.")
     print(f"[INFO]  CRS: {gdf.crs}")
 
@@ -58,64 +69,84 @@ def fetch_county_boundaries():
     return gdf
 
 
-def import_geometry(conn, gdf):
-    updated = 0
-    skipped = 0
-    errors  = 0
+def upsert_geometry(conn, gdf, state_code: str):
+    inserted = 0
+    updated  = 0
+    errors   = 0
 
-    print("[INFO]  Updating county geometries in database …")
+    print(f"[INFO]  Upserting {state_code} county geometries …")
     with conn.cursor() as cur:
         for _, row in gdf.iterrows():
+            geoid       = str(row.get("GEOID", "")).strip()
             county_name = row.get("NAME", "").upper().strip()
             geom_wkt    = row.geometry.wkt
+
+            if not geoid or not county_name:
+                print(f"[WARN]  Missing GEOID or NAME for row — skipping.")
+                errors += 1
+                continue
 
             try:
                 cur.execute(
                     """
-                    UPDATE counties
-                    SET geometry = ST_Multi(ST_GeomFromText(%s, 4326))
-                    WHERE name = %s
+                    INSERT INTO counties (fips_code, name, geometry, state_code)
+                    VALUES (%s, %s, ST_Multi(ST_GeomFromText(%s, 4326)), %s)
+                    ON CONFLICT (fips_code) DO UPDATE SET
+                        name       = EXCLUDED.name,
+                        geometry   = EXCLUDED.geometry,
+                        state_code = EXCLUDED.state_code
+                    RETURNING xmax = 0 AS was_insert
                     """,
-                    (geom_wkt, county_name)
+                    (geoid, county_name, geom_wkt, state_code),
                 )
-                if cur.rowcount == 1:
-                    updated += 1
-                    print(f"[OK]    {county_name}")
+                result = cur.fetchone()
+                if result and result[0]:
+                    inserted += 1
+                    print(f"[NEW]   {state_code} {geoid} {county_name}")
                 else:
-                    print(f"[WARN]  No match for '{county_name}' — skipping.")
-                    skipped += 1
+                    updated += 1
+                    print(f"[UPD]   {state_code} {geoid} {county_name}")
             except psycopg2.Error as e:
                 conn.rollback()
-                print(f"[ERROR] Failed to update {county_name}: {e}")
+                print(f"[ERROR] Failed for {geoid} {county_name}: {e}")
                 errors += 1
                 continue
 
         conn.commit()
 
     print()
-    print("─" * 50)
-    print(f"[DONE]  Geometry import complete.")
-    print(f"        Updated : {updated:>5}")
-    print(f"        Skipped : {skipped:>5}")
-    print(f"        Errors  : {errors:>5}")
-    print("─" * 50)
-
-    if updated < 88:
-        print(f"[WARN]  Only {updated}/88 counties updated. Check name mismatches above.")
+    print("-" * 50)
+    print(f"[DONE]  {state_code} county geometry import complete.")
+    print(f"        Inserted : {inserted:>5}")
+    print(f"        Updated  : {updated:>5}")
+    print(f"        Errors   : {errors:>5}")
+    print("-" * 50)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--state",
+        default="OH",
+        help="Two-letter state code (e.g. OH, PA, WV). Default: OH.",
+    )
+    args = parser.parse_args()
+    state_code = args.state.upper().strip()
+    if len(state_code) != 2:
+        print(f"[ERROR] --state must be a 2-letter code, got '{args.state}'.")
+        sys.exit(1)
+
     print()
-    print("=== Ohio County Geometry Importer ===")
+    print(f"=== County Geometry Importer ({state_code}) ===")
     print()
 
     check_dependencies()
 
     conn = connect()
     try:
-        gdf = fetch_county_boundaries()
-        import_geometry(conn, gdf)
+        gdf = fetch_county_boundaries(state_code)
+        upsert_geometry(conn, gdf, state_code)
     except KeyboardInterrupt:
         print()
         print("[ABORT] Interrupted by user.")
