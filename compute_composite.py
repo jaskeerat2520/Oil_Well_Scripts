@@ -8,28 +8,40 @@ Dimensions and default weights:
 
   water_risk_score        25%   (distance to protection zones)
   population_risk_score   15%   (human exposure within 1km / 5km buffers)
-  vegetation_risk_score   20%   (derived from NDVI trend + NDMI change + anomaly)
-  terrain_risk_score      10%   (from well_remote_sensing — artificial pad flatness)
+  vegetation_risk_score   15%   (derived from NDVI trend + NDMI change + anomaly)
+  terrain_risk_score       5%   (from well_remote_sensing — artificial pad flatness)
   emissions_risk_score    20%   (from well_remote_sensing — plumes + thermal)
-  inactivity_score        10%   (from well_risk_scores — years_inactive bucketing
+  inactivity_score        20%   (from well_risk_scores — years_inactive bucketing
                                  set by backfill_production_years.py; 0 for
                                  Producing wells by design)
+
+Inactivity carries 20% weight (boosted from 10%) because filing/production
+records are the cleanest single signal for orphan-candidate identification:
+36% of wells score 0 (verified-active producers) and 11% score 100 (deep
+inactivity), so the dimension genuinely discriminates. Vegetation and terrain
+were demoted because both are 0-dominated for most wells (the algorithms
+write 0 for "ran, no anomaly") — boosting them inflated noise more than
+signal. RS dims combined still carry 40% (15 veg + 5 terr + 20 emis).
 
 Missing components are handled by renormalizing: the weights of the *available*
 dimensions sum to 100% for each well, so partial-data wells are scored fairly
 against themselves rather than penalized.
 
-Priority buckets (calibrated to the realised composite distribution — RS
-signals contribute 0s rather than NULLs for wells without anomalies, which
-caps the achievable composite well below 100):
+Priority buckets:
 
-    composite ≥ 45  → critical   (~top 0.06% — map-noticeable elite tier)
-    composite ≥ 35  → high       (~top 1.3%)
-    composite ≥ 25  → medium     (~top 17.6%)
+    composite ≥ 45  → critical
+    composite ≥ 35  → high
+    composite ≥ 25  → medium
     else            → low
 
-Producing wells are capped at priority='medium' regardless of composite
-(per CLAUDE.md convention — active producers are not plugging candidates).
+Two policy arms layered on top:
+  - Historic-owner wells with no production filing on record are floored to
+    medium (presumptive orphan candidates whose RS-zero dilution would
+    otherwise sink them under the threshold).
+  - All other wells follow composite directly. The previous "Producing +
+    recent prod → cap at medium" ceiling has been removed — high-composite
+    producers are still high-environmental-risk wells regardless of who's
+    nominally on the operator line.
 
 Usage:
     python compute_composite.py
@@ -63,6 +75,7 @@ WITH dims AS (
     wrs.api_no,
     w.status,
     w.last_nonzero_production_year,
+    wrs.operator_status,
     wrs.water_risk_score,
     wrs.population_risk_score,
     wrs.inactivity_score,
@@ -73,7 +86,13 @@ WITH dims AS (
     --   slope < -0.015 →  ~50
     --   slope < -0.005 →  ~25
     -- NDMI drop adds up to +20 on top.  Capped at 100.
-    LEAST(100,
+    --
+    -- When there is no row in well_surface_anomalies at all (LEFT JOIN miss),
+    -- the inner expressions all collapse to 0 and would silently feed a "0"
+    -- into the renormalizer as if vegetation had been measured. Return NULL
+    -- in that case so weights_present excludes the dimension.
+    CASE WHEN wsa.api_no IS NULL THEN NULL
+    ELSE LEAST(100,
       GREATEST(
         COALESCE(wsa.anomaly_score, 0),
         CASE
@@ -88,7 +107,8 @@ WITH dims AS (
           WHEN wsa.ndmi_change < -0.05 THEN 10
           ELSE 0
         END
-    )::double precision AS vegetation_score,
+    )::double precision
+    END AS vegetation_score,
 
     wrs2.terrain_risk_score::double precision   AS terrain_score,
     wrs2.emissions_risk_score::double precision AS emissions_score
@@ -99,28 +119,28 @@ WITH dims AS (
 ),
 scored AS (
   SELECT
-    api_no, status, last_nonzero_production_year,
+    api_no, status, last_nonzero_production_year, operator_status,
     water_risk_score, population_risk_score, inactivity_score,
     vegetation_score, terrain_score, emissions_score,
     -- Weighted sum (zeros for NULL, numerator only)
     (COALESCE(water_risk_score,      0) * 0.25
    + COALESCE(population_risk_score, 0) * 0.15
-   + COALESCE(vegetation_score,      0) * 0.20
-   + COALESCE(terrain_score,         0) * 0.10
+   + COALESCE(vegetation_score,      0) * 0.15
+   + COALESCE(terrain_score,         0) * 0.05
    + COALESCE(emissions_score,       0) * 0.20
-   + COALESCE(inactivity_score,      0) * 0.10) AS weighted_sum,
+   + COALESCE(inactivity_score,      0) * 0.20) AS weighted_sum,
     -- Sum of weights for *present* dimensions only — normalizer
     ( (CASE WHEN water_risk_score      IS NOT NULL THEN 0.25 ELSE 0 END)
     + (CASE WHEN population_risk_score IS NOT NULL THEN 0.15 ELSE 0 END)
-    + (CASE WHEN vegetation_score      IS NOT NULL THEN 0.20 ELSE 0 END)
-    + (CASE WHEN terrain_score         IS NOT NULL THEN 0.10 ELSE 0 END)
+    + (CASE WHEN vegetation_score      IS NOT NULL THEN 0.15 ELSE 0 END)
+    + (CASE WHEN terrain_score         IS NOT NULL THEN 0.05 ELSE 0 END)
     + (CASE WHEN emissions_score       IS NOT NULL THEN 0.20 ELSE 0 END)
-    + (CASE WHEN inactivity_score      IS NOT NULL THEN 0.10 ELSE 0 END) ) AS weights_present
+    + (CASE WHEN inactivity_score      IS NOT NULL THEN 0.20 ELSE 0 END) ) AS weights_present
   FROM dims
 ),
 final AS (
   SELECT
-    api_no, status, last_nonzero_production_year,
+    api_no, status, last_nonzero_production_year, operator_status,
     vegetation_score, terrain_score, emissions_score,
     CASE
       WHEN weights_present > 0 THEN weighted_sum / weights_present
@@ -135,16 +155,24 @@ SET
   emissions_risk_score  = f.emissions_score,
   composite_risk_score  = f.composite,
   priority = CASE
-    -- Verified-active producers (recent production) stay capped at medium —
-    -- these are regulated operations where enforcement runs through the
-    -- operator, not the state plugging fund.
-    WHEN f.status = 'Producing' AND f.last_nonzero_production_year >= 2020 THEN
+    -- Floor: historic-owner wells with no production filing on record are
+    -- presumptive orphan candidates. The natural arithmetic composite for
+    -- these wells caps below 25 because the three remote-sensing dimensions
+    -- output 0 ("ran, no anomaly") rather than NULL, dragging the average
+    -- down. Surface them at minimum medium so they don't disappear into
+    -- the green-dot pool. Composites above the threshold still bucket into
+    -- high/critical normally.
+    WHEN f.operator_status = 'historic_owner' AND f.last_nonzero_production_year IS NULL THEN
       CASE
-        WHEN f.composite >= 25 THEN 'medium'
-        ELSE 'low'
+        WHEN f.composite >= 45 THEN 'critical'
+        WHEN f.composite >= 35 THEN 'high'
+        ELSE 'medium'
       END
-    -- Zombie / paperwork producers (Producing status with stale or null
-    -- production) are hidden orphans and should NOT be capped.
+    -- Default: priority follows composite for every well. The previous
+    -- producer-cap rule (Producing + recent prod → cap at medium) is gone:
+    -- a high-composite producer is still a high-environmental-risk well
+    -- regardless of who's nominally the operator, and capping them painted
+    -- the map dishonestly.
     WHEN f.composite >= 45 THEN 'critical'
     WHEN f.composite >= 35 THEN 'high'
     WHEN f.composite >= 25 THEN 'medium'
